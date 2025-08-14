@@ -11,12 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     fonts-liberation \
     libnss3 \
-    libgdk-pixbuf-xlib-2.0-0 \  # تغییر به این
+    libgdk-pixbuf-xlib-2.0-0 \
     libasound2 \
     libxss1 \
     libgtk-3-0 \
     libgbm1 \
-    curl  && rm -rf /var/lib/apt/lists/*
+    curl && rm -rf /var/lib/apt/lists/*
 
 # تنظیم دایرکتوری کاری در کانتینر
 WORKDIR /app

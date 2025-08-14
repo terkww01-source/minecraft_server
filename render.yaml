@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: minecraft-dashboard
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /api/status
+    envVars:
+      - key: PORT
+        value: "10000"
+      # ====== این‌ها را خودت در Render > Environment پر کن ======
+      # آدرس صفحهٔ سرور مگما‌نود
+      - key: MAGMANODE_SERVER_URL
+        value: "https://magmanode.com/server?id=770999"
+      # JSON کوکی‌های دامنهٔ magmanode.com (محتوای Export کوکی‌ها)
+      - key: MAGMANODE_COOKIES_JSON
+        sync: false
+      # فاصلهٔ بررسی خودکار (دقیقه؛ حداقل و حداکثر برای بازهٔ تصادفی)
+      - key: CHECK_MIN_MINUTES
+        value: "1"
+      - key: CHECK_MAX_MINUTES
+        value: "3"
+      # لاگ بیشتر یا کمتر
+      - key: LOG_LEVEL
+        value: "INFO"

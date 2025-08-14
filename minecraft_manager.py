@@ -5,6 +5,7 @@ import json
 import threading
 from datetime import datetime, timedelta
 import logging
+from urllib.parse import urlparse
 
 from flask import Flask, render_template, jsonify, request
 
@@ -24,8 +25,26 @@ logger = logging.getLogger("minecraft_manager")
 
 STATUS_FILE = 'server_status.json'
 
-# تنظیمات از محیط Render
-MAGMA_SERVER_URL = os.environ.get("MAGMANODE_SERVER_URL", "https://magmanode.com/server?id=770999")
+# ---------- helpers ----------
+def normalize_url(raw: str, fallback: str) -> str:
+    try:
+        u = (raw or "").strip().strip('"').strip("'")
+        if not u:
+            raise ValueError("empty URL")
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u
+        p = urlparse(u)
+        if not p.scheme or not p.netloc:
+            raise ValueError("parsed URL missing scheme or host")
+        return u
+    except Exception as e:
+        logger.error(f"⚠️ MAGMANODE_SERVER_URL نامعتبر است ({e}); از مقدار پیش‌فرض استفاده می‌کنم.")
+        return fallback
+
+DEFAULT_SERVER_URL = "https://magmanode.com/server?id=770999"
+RAW_SERVER_URL = os.environ.get("MAGMANODE_SERVER_URL", DEFAULT_SERVER_URL)
+MAGMA_SERVER_URL = normalize_url(RAW_SERVER_URL, DEFAULT_SERVER_URL)
+
 COOKIES_JSON = os.environ.get("MAGMANODE_COOKIES_JSON", "")
 
 CHECK_MIN_MINUTES = float(os.environ.get("CHECK_MIN_MINUTES", "1"))
@@ -48,6 +67,9 @@ class MinecraftServerManager:
         self.auto_click_active = True
         self.monitoring_active = True
         self.is_ready = False
+        self.server_url = MAGMA_SERVER_URL
+
+        logger.info(f"🌐 URL در حال استفاده: {self.server_url}")
 
         # وضعیت اولیه
         self.status = {
@@ -70,7 +92,7 @@ class MinecraftServerManager:
         self._setup_driver_headless()
         # تلاش برای تزریق کوکی‌ها (اگر وجود داشته باشد)
         if COOKIES_JSON:
-            self._inject_cookies_if_any(COOKIES_JSON, MAGMA_SERVER_URL)
+            self._inject_cookies_if_any(COOKIES_JSON, self.server_url)
         else:
             logger.warning("کوکی‌های MAGMANODE_COOKIES_JSON تنظیم نشده‌اند؛ احتمال ری‌دایرکت به /login.")
 
@@ -106,7 +128,6 @@ class MinecraftServerManager:
             raise
 
     def _domain_root(self, url: str) -> str:
-        from urllib.parse import urlparse
         p = urlparse(url)
         return f"{p.scheme}://{p.hostname}"
 
@@ -140,7 +161,6 @@ class MinecraftServerManager:
                 }
                 if "expires" in c or "expiry" in c:
                     cookie_dict["expiry"] = int(c.get("expires") or c.get("expiry"))
-                # اگر domain نداشت، اتوماتیک روی دامنه فعلی ست می‌شود
                 self.driver.add_cookie(cookie_dict)
                 added += 1
             except Exception as e:
@@ -195,20 +215,31 @@ class MinecraftServerManager:
         except Exception:
             return False
 
+    def _safe_get(self, url: str) -> bool:
+        """navigate safely; return True on success, False on failure"""
+        try:
+            self.driver.get(url)
+            return True
+        except Exception as e:
+            logger.error(f"❌ خطا در باز کردن URL: {e} | url='{url}'")
+            return False
+
     def _get_server_status(self) -> str:
         """کوشش برای تشخیص وضعیت سرور با متن یا دکمه‌ها"""
         try:
             # اگر هنوز صفحهٔ سرور لود نشده، برو
             if "magmanode.com" not in (self.driver.current_url or ""):
-                self.driver.get(MAGMA_SERVER_URL)
+                if not self._safe_get(self.server_url):
+                    return 'unknown'
                 time.sleep(3)
 
-            self.status['current_url'] = self.driver.current_url
+            self.status['current_url'] = self.driver.current_url or ""
 
-            url_l = (self.driver.current_url or "").lower()
+            url_l = self.status['current_url'].lower()
             if "/login" in url_l:
-                detected = 'offline'  # از منظر «ما خارجیم»؛ اما بهتر اینکه unknown بگیریم
                 logger.warning("به صفحهٔ login ری‌دایرکت شدیم؛ احتمالاً کوکی‌ها نامعتبرند.")
+                self.status['start_button_available'] = False
+                self.status['stop_button_available'] = False
                 return 'unknown'
 
             # خواندن متن وضعیت
@@ -332,9 +363,21 @@ class MinecraftServerManager:
     def run_auto_clicker(self, url=None, max_clicks=None):
         try:
             logger.info("🚀 شروع Auto Clicker...")
-            if url:
-                self.driver.get(url)
-                time.sleep(5)
+            # ترد مانیتورینگ را از همین ابتدا روشن کن که حتی اگر ناوبری خطا داد، داشبورد زنده بماند
+            mt = threading.Thread(target=self.continuous_monitoring, daemon=True)
+            mt.start()
+            self.is_ready = True
+
+            target = (url or self.server_url)
+            # تلاش اولیه برای باز کردن صفحه
+            if not self._safe_get(target):
+                # اگر نشد، چند بار دیگر هم تلاش کن
+                for _ in range(3):
+                    time.sleep(3)
+                    if self._safe_get(target):
+                        break
+
+            time.sleep(5)
 
             # وضعیت اولیه
             initial_status = self._get_server_status()
@@ -342,22 +385,17 @@ class MinecraftServerManager:
             self._update_next_check_time()
             self._save_status_to_file()
 
-            # ترد مانیتورینگ
-            mt = threading.Thread(target=self.continuous_monitoring, daemon=True)
-            mt.start()
-
-            self.is_ready = True
             logger.info("✅ سیستم آماده شد. حلقهٔ کلیکر شروع شد.")
 
             while self.auto_click_active:
                 try:
                     curr = self._get_server_status()
-                    # اگر سرور روشن است، صرفاً صبر کن
+                    # اگر سرور روشن است، صبر کن
                     if curr == 'running':
                         time.sleep(self._get_random_wait_time())
                         continue
 
-                    # اگر آف‌لاین است، تلاش برای START
+                    # اگر آف‌لاین/نامعلوم است، تلاش برای START
                     if curr in ('offline', 'unknown', 'starting'):
                         try:
                             btn = self._find_start_button()
@@ -365,7 +403,6 @@ class MinecraftServerManager:
                                 self.click_count += 1
                                 self.status['last_action'] = f"START @ {datetime.now().strftime('%H:%M:%S')}"
                                 self._save_status_to_file()
-                                # کمی صبر کن تا وضعیت تغییر کند
                                 time.sleep(15)
                         except Exception as e:
                             self.failed_clicks += 1
@@ -554,6 +591,7 @@ def run_server_manager():
     global server_manager
     try:
         server_manager = MinecraftServerManager()
+        # 🔁 دیگر حتی اگر یک بار navigate خطا دهد، run_auto_clicker خودش retry می‌کند و خارج نمی‌شود
         server_manager.run_auto_clicker(url=MAGMA_SERVER_URL, max_clicks=None)
     except Exception as e:
         logger.error(f"❌ خطا در اجرای مدیر: {e}")

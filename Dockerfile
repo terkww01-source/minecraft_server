@@ -5,18 +5,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # نصب Chromium و ChromeDriver و کتابخانه‌های لازم
+# تغییر به این صورت
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     fonts-liberation \
     libnss3 \
-    libgdk-pixbuf2.0-0 \
+    libgdk-pixbuf-xlib-2.0-0 \  # تغییر به این
     libasound2 \
     libxss1 \
     libgtk-3-0 \
     libgbm1 \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+    curl  && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 

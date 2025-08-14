@@ -15,7 +15,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("auth_checker")
 
-MAGMA_SERVER_URL = os.environ.get("MAGMANODE_SERVER_URL", "https://magmanode.com/server?id=770999")
+# ---------- helpers ----------
+def normalize_url(raw: str, fallback: str) -> str:
+    """Trim spaces and quotes; ensure scheme; validate host; fallback if broken."""
+    try:
+        u = (raw or "").strip().strip('"').strip("'")
+        if not u:
+            raise ValueError("empty URL")
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u
+        p = urlparse(u)
+        if not p.scheme or not p.netloc:
+            raise ValueError("parsed URL missing scheme or host")
+        return u
+    except Exception as e:
+        logger.error(f"⚠️ MAGMANODE_SERVER_URL نامعتبر است ({e}); از مقدار پیش‌فرض استفاده می‌کنم.")
+        return fallback
+
+DEFAULT_SERVER_URL = "https://magmanode.com/server?id=770999"
+RAW_SERVER_URL = os.environ.get("MAGMANODE_SERVER_URL", DEFAULT_SERVER_URL)
+MAGMA_SERVER_URL = normalize_url(RAW_SERVER_URL, DEFAULT_SERVER_URL)
+
 COOKIES_JSON = os.environ.get("MAGMANODE_COOKIES_JSON", "")
 
 CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
@@ -24,7 +44,7 @@ CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 def _chrome_options() -> Options:
     opts = Options()
-    # هدلس برای Render
+    # Headless for Render
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -33,10 +53,8 @@ def _chrome_options() -> Options:
     opts.add_argument("--window-size=1366,768")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    # اگر مسیر باینری مشخص باشد
     if CHROME_BIN and os.path.exists(CHROME_BIN):
         opts.binary_location = CHROME_BIN
-    # اندکی استلث
     opts.add_argument("--disable-blink-features=AutomationControlled")
     return opts
 
@@ -44,14 +62,14 @@ def _chrome_options() -> Options:
 def _start_driver() -> webdriver.Chrome:
     service = Service(CHROMEDRIVER_PATH)
     driver = webdriver.Chrome(service=service, options=_chrome_options())
-    # پنهان کردن navigator.webdriver
+    # stealth
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator,'webdriver',{get:() => undefined});"},
         )
-    except Exception as e:
-        logger.debug(f"Stealth script error: {e}")
+    except Exception:
+        pass
     return driver
 
 
@@ -73,7 +91,6 @@ def _inject_cookies_if_any(driver: webdriver.Chrome, cookies_json: str, base_url
         logger.error(f"فرمت کوکی‌ها نامعتبر است: {e}")
         return
 
-    # باید یک بار وارد دامنه شویم تا add_cookie مجاز باشد
     root = _domain_root(base_url)
     driver.get(root)
     time.sleep(1)
@@ -81,12 +98,10 @@ def _inject_cookies_if_any(driver: webdriver.Chrome, cookies_json: str, base_url
     added = 0
     for c in cookies:
         try:
-            # حداقل‌ها: name و value
             name = c.get("name")
             value = c.get("value")
             if not name or value is None:
                 continue
-
             cookie_dict = {
                 "name": name,
                 "value": value,
@@ -95,41 +110,36 @@ def _inject_cookies_if_any(driver: webdriver.Chrome, cookies_json: str, base_url
                 "secure": c.get("secure", True),
                 "httpOnly": c.get("httpOnly", False),
             }
-            if "expires" in c:
-                # برخی exporter ها از expires یا expiry استفاده می‌کنند
+            if "expires" in c or "expiry" in c:
                 cookie_dict["expiry"] = int(c.get("expires") or c.get("expiry"))
-
             driver.add_cookie(cookie_dict)
             added += 1
-        except Exception as e:
-            logger.debug(f"خطا در افزودن یک کوکی: {e}")
+        except Exception:
+            continue
 
     logger.info(f"✅ {added} کوکی برای دامنه تزریق شد.")
 
 
 def is_logged_in(driver: webdriver.Chrome, server_url: str) -> bool:
-    driver.get(server_url)
+    driver.get(server_url)  # اگر url نرمال نباشد، قبلش normalize شده
     time.sleep(3)
 
-    current = driver.current_url.lower()
+    current = (driver.current_url or "").lower()
     if "/login" in current:
         return False
 
-    # یک چک ساده: اگر دکمه START یا متن وضعیت را ببینیم یعنی واردیم
     try:
-        # هرکدام موجود بود، احتمالاً لاگین برقرار است
         has_start = len(driver.find_elements(By.CSS_SELECTOR, 'button[data-action="start"], button.bg-green-600')) > 0
         has_status = len(driver.find_elements(By.CSS_SELECTOR, 'span[data-server-status], .server-status, .status-indicator')) > 0
-        if has_start or has_status:
-            return True
+        return bool(has_start or has_status)
     except Exception:
-        pass
-    # اگر ری‌دایرکت به login نبود، باز هم احتمالاً لاگین برقرار است
-    return "/login" not in driver.current_url.lower()
+        # اگر به login نرفت، باز هم به‌احتمال زیاد واردیم
+        return "/login" not in (driver.current_url or "").lower()
 
 
 def main():
     logger.info("🔐 شروع بررسی احراز هویت (Render/Headless)")
+    logger.info(f"🌐 URL در حال استفاده: {MAGMA_SERVER_URL}")
     driver = None
     try:
         driver = _start_driver()

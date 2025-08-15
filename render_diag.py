@@ -1,149 +1,294 @@
-import os, json, time, traceback, logging
+import os, json, time, pathlib, traceback
 from flask import Flask, request, jsonify, Response
-
-# === Selenium ===
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+import requests
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("render_diag")
 
-def env_get(name, *alts, default=None):
-    for k in (name,) + alts:
-        v = os.getenv(k)
-        if v:
-            return v
-    return default
+# ---------- تنظیمات ----------
+PORT = int(os.getenv("PORT", "10000"))
+SELF_HINT = os.getenv("SELF_URL", "").strip()  # اختیاری
+MAGMA_URL = os.getenv("MAGMA_URL", "https://magmanode.com/server?id=770999").strip()
 
-def parse_cookies(raw):
-    if not raw:
-        return [], "NO_COOKIES_SET"
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        out = []
-        allow = {"name","value","domain","path","expiry","secure","httpOnly"}
-        for c in data:
-            # فقط کلیدهای مجاز Selenium
-            out.append({k: c[k] for k in allow if k in c})
-        return out, None
-    except Exception as e:
-        return [], f"COOKIES_JSON_INVALID: {e}"
+# کوکی‌ها را یا از env بخوان، یا از فایل cookies.json (اختیاری)
+def load_cookies_for_domain():
+    """
+    پشتیبانی از سه حالت:
+    1) env: MAGMA_COOKIES = '[{"name":"...", "value":"...", "domain":"magmanode.com"}]'
+    2) env: MAGMA_COOKIE_NAME, MAGMA_COOKIE_VALUE, MAGMA_COOKIE_DOMAIN
+    3) فایل ./cookies.json حاوی آرایه‌ی کوکی‌ها
+    """
+    env_json = os.getenv("MAGMA_COOKIES", "").strip()
+    if env_json:
+        try: return json.loads(env_json)
+        except: pass
 
-def build_driver():
-    chrome_bin_candidates = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
-    binary = next((p for p in chrome_bin_candidates if os.path.exists(p)), None)
+    name = os.getenv("MAGMA_COOKIE_NAME", "").strip()
+    value = os.getenv("MAGMA_COOKIE_VALUE", "").strip()
+    domain = os.getenv("MAGMA_COOKIE_DOMAIN", "magmanode.com").strip()
+    if name and value:
+        return [{"name": name, "value": value, "domain": domain, "path": "/"}]
+
+    # فایل
+    p = pathlib.Path("cookies.json")
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except:
+            return []
+    return []
+
+def make_driver():
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    chrome_drv = os.getenv("CHROME_DRIVER", "/usr/bin/chromedriver")
 
     opts = Options()
-    if binary:
-        opts.binary_location = binary
+    # Headless پایدار
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1280,1000")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1280,2000")
+    opts.binary_location = chrome_bin
 
-    service_path = "/usr/bin/chromedriver"  # روی Render نصب می‌شود
-    service = Service(executable_path=service_path)
-    driver = webdriver.Chrome(service=service, options=opts)
-    return driver, {"binary": binary or "auto", "driver": service_path}
+    driver = webdriver.Chrome(executable_path=chrome_drv, options=opts)
+    driver.set_page_load_timeout(45)
+    driver.implicitly_wait(0)
+    return driver
 
-def click_btn(driver, action):
-    selector = f'button[data-action="{action}"]'
-    btn = WebDriverWait(driver, 12).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-    )
-    btn.click()
-    return {"clicked": True, "selector": selector}
+def inject_cookies(driver, url, steps):
+    cookies = load_cookies_for_domain()
+    steps.append(f"cookies.load={len(cookies)}")
+    if not cookies:
+        return 0
 
-def run_diag(action):
-    server_url = env_get("MAGMANODE_SERVER_URL", "PANEL_URL", "PANEL_URL1", "PANEL_URL2")
-    cookies_raw = env_get("MAGMANODE_COOKIES_JSON", "COOKIES_JSON")
-    cookies, cookies_err = parse_cookies(cookies_raw)
+    base = "https://magmanode.com/"
+    driver.get(base)
+    time.sleep(1.2)
+    ok = 0
+    for c in cookies:
+        try:
+            cc = {"name": c["name"], "value": c["value"], "path": c.get("path","/")}
+            if "domain" in c: cc["domain"] = c["domain"]
+            driver.add_cookie(cc)
+            ok += 1
+        except Exception as e:
+            steps.append(f"cookies.add.error={repr(e)}")
+    return ok
 
-    diag = {
-        "server_url": server_url,
-        "env_ok": bool(server_url and cookies_raw),
-        "cookies_count": len(cookies),
-        "cookies_error": cookies_err,
-        "action": action or "",
-        "steps": []
+def multi_find(driver, action, steps):
+    """چندین لوکِیتِر برای اطمینان از پیدا شدن دکمه"""
+    selectors = [
+        (By.CSS_SELECTOR, f'button[data-action="{action}"]'),
+        (By.XPATH, f'//button[normalize-space()="{action.upper()}"]'),
+        (By.XPATH, f'(//button[contains(., "{action.upper()}")])[1]'),
+        (By.XPATH, f'//button[contains(@class,"bg-{"green" if action=="start" else "red"}-600")]'),
+    ]
+    last_err = None
+    for by, sel in selectors:
+        try:
+            steps.append(f"wait.clickable:{by}={sel}")
+            btn = WebDriverWait(driver, 12).until(EC.element_to_be_clickable((by, sel)))
+            return btn, (by, sel)
+        except Exception as e:
+            last_err = e
+            steps.append(f"miss:{by}={sel}")
+    raise last_err if last_err else TimeoutException("button not found")
+
+def click_button(driver, action, steps):
+    # اسکرول آرام بالا تا پایین برای رندر
+    driver.execute_script("window.scrollTo(0,0)")
+    time.sleep(0.4)
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.4)")
+    time.sleep(0.4)
+
+    btn, used = multi_find(driver, action, steps)
+    steps.append(f"found:{used}")
+
+    # اول try با click معمولی
+    try:
+        btn.click()
+        steps.append("clicked:native")
+        return True
+    except Exception as e:
+        steps.append(f"native_click_fail:{repr(e)}")
+
+    # بعد JS click
+    try:
+        driver.execute_script("arguments[0].click();", btn)
+        steps.append("clicked:js")
+        return True
+    except Exception as e:
+        steps.append(f"js_click_fail:{repr(e)}")
+
+    # آخر: focus + enter
+    try:
+        driver.execute_script("arguments[0].focus();", btn)
+        time.sleep(0.2)
+        btn.send_keys("\n")
+        steps.append("clicked:enter")
+        return True
+    except Exception as e:
+        steps.append(f"enter_click_fail:{repr(e)}")
+        return False
+
+def snap(driver, name):
+    pathlib.Path("static").mkdir(exist_ok=True)
+    path = f"static/{name}"
+    try:
+        driver.save_screenshot(path)
+        return path
+    except:
+        return None
+
+def page_has_start_stop_by_html(html):
+    has_start = 'data-action="start"' in html or ">START<" in html
+    has_stop  = 'data-action="stop"'  in html or ">STOP<"  in html
+    return {"has_start": has_start, "has_stop": has_stop}
+
+def run_diag(action: str):
+    steps = []
+    info = {
+        "server_url": MAGMA_URL,
+        "env_ok": True,
+        "cookies_count": 0,
+        "cookies_error": None,
+        "action": action,
+        "chrome_meta": {"binary": "/usr/bin/chromium", "driver": "/usr/bin/chromedriver"},
+        "ok": False,
+        "steps": steps,
+        "shots": {},
     }
 
-    if not server_url:
-        diag["error"] = "NO_SERVER_URL_SET"
-        return diag
-    if cookies_err:
-        diag["error"] = cookies_err
-        return diag
-
-    driver, meta = build_driver()
-    diag["chrome_meta"] = meta
+    drv = None
     try:
-        driver.get(server_url)
+        drv = make_driver()
+        steps.append("driver.ok")
 
-        # تزریق کوکی‌ها
-        for c in cookies:
-            try:
-                if "path" not in c:
-                    c["path"] = "/"
-                driver.add_cookie(c)
-            except Exception as e:
-                diag["steps"].append({"add_cookie_failed": str(e), "cookie": c.get("name")})
+        # کوکی
+        added = inject_cookies(drv, MAGMA_URL, steps)
+        info["cookies_count"] = added
 
-        driver.refresh()
-        time.sleep(1.2)
+        # رفتن به صفحه
+        url = MAGMA_URL.strip()
+        steps.append(f"goto:{url}")
+        drv.get(url)
 
+        # منتظر وجود body
+        WebDriverWait(drv, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(0.8)
+
+        info["shots"]["before"] = snap(drv, "diag_before.png")
+
+        # اگر اکشن داریم کلیک کن
         if action in ("start", "stop"):
-            step = click_btn(driver, action)
-            diag["steps"].append(step)
-            diag["ok"] = True
+            ok = click_button(drv, action, steps)
+            steps.append(f"click_result={ok}")
+            time.sleep(2.0)
+            info["shots"]["after"] = snap(drv, "diag_after.png")
         else:
-            diag["note"] = "no action, opened and injected cookies"
-            diag["ok"] = True
-    finally:
-        driver.quit()
+            steps.append("no_action")
 
-    return diag
+        # وضعیت حضور دکمه‌ها در HTML
+        html = drv.page_source
+        info.update(page_has_start_stop_by_html(html))
+        info["ok"] = True
+        return info
 
-@app.route("/")
-def home():
-    return Response("""
-<h3>Render Diagnostic</h3>
-<ul>
-  <li><a href="/diag">/diag</a></li>
-  <li><a href="/diag?format=json">/diag?format=json</a></li>
-  <li>کلیک: <a href="/diag?action=start">START</a> | <a href="/diag?action=stop">STOP</a></li>
-</ul>
-""", mimetype="text/html")
-
-@app.route("/api/status")
-def api_status():
-    return jsonify({"ok": True, "service": "render_diag", "ts": int(time.time())})
-
-@app.route("/diag")
-def diag():
-    action = request.args.get("action", "")
-    as_json = request.args.get("format") == "json"
-    try:
-        result = run_diag(action)
-        if as_json:
-            return jsonify(result)
-        return Response("<pre>" + json.dumps(result, ensure_ascii=False, indent=2) + "</pre>",
-                        mimetype="text/html")
     except Exception as e:
-        tb = traceback.format_exc()
-        log.exception("diag failed")
-        payload = {"ok": False, "error": str(e), "trace": tb}
-        if as_json or os.getenv("DEBUG") == "1":
-            return jsonify(payload), 500
-        return Response("<h4>Internal Error</h4><pre>"+tb+"</pre>", status=500, mimetype="text/html")
+        info["ok"] = False
+        info["error"] = repr(e)
+        info["trace"] = traceback.format_exc()
+        return info
+    finally:
+        try:
+            if drv: drv.quit()
+        except:
+            pass
+
+def check_pages():
+    """دو لینک: 1) همین سرویس، 2) صفحه Magma  — فقط در حد up بودن و (در صورت دسترسی) نشانه دکمه‌ها"""
+    out = {"self": {}, "magma": {}}
+
+    # 1) وضعیت خود سرویس
+    try:
+        base = SELF_HINT or request.host_url
+        r = requests.get(base, timeout=8)
+        out["self"] = {"url": base, "status": r.status_code, "ok": r.ok}
+    except Exception as e:
+        out["self"] = {"url": SELF_HINT or request.host_url, "error": repr(e)}
+
+    # 2) وضعیت صفحه Magma (اگر لاگین لازم باشد ممکن است 302/401 بیاید—همین را گزارش می‌کنیم)
+    try:
+        r2 = requests.get(MAGMA_URL, timeout=10, allow_redirects=True)
+        html_snip = r2.text[:2000]
+        signs = page_has_start_stop_by_html(html_snip)
+        out["magma"] = {"url": MAGMA_URL, "status": r2.status_code, **signs}
+    except Exception as e:
+        out["magma"] = {"url": MAGMA_URL, "error": repr(e)}
+
+    return out
+
+# ---------- Routes ----------
+@app.get("/")
+def root():
+    return Response(
+        """<h2>Render Diagnostic</h2>
+<ul>
+<li>رفتن به گزارش: <a href="/diag">/diag</a></li>
+<li>JSON: <a href="/diag?format=json">/diag?format=json</a></li>
+<li>کلیک و گزارش همزمان: <a href="/diag?action=start">start</a> | <a href="/diag?action=stop">stop</a></li>
+<li>وضعیت دو لینک: <a href="/api/status">/api/status</a></li>
+</ul>
+""",
+        mimetype="text/html"
+    )
+
+@app.get("/api/status")
+def api_status():
+    return jsonify({
+        "ok": True,
+        "service": "render_diag",
+        "version": "v2",
+        "pages": check_pages(),
+    })
+
+@app.get("/diag")
+def diag():
+    action = (request.args.get("action") or "").strip().lower()
+    fmt = (request.args.get("format") or "").strip().lower()
+
+    result = run_diag(action if action in ("start","stop") else "")
+    if fmt == "json":
+        return jsonify(result)
+
+    # HTML ساده با لینک‌ها و شات‌ها
+    rows = "".join([f"<li>{i+1}. {step}</li>" for i, step in enumerate(result.get("steps", []))])
+    shots = result.get("shots", {})
+    before = shots.get("before")
+    after  = shots.get("after")
+
+    html = f"""
+<h3>Diag</h3>
+<p><b>ok:</b> {result.get('ok')}</p>
+<p><b>action:</b> {result.get('action')}</p>
+<p><b>server_url:</b> {result.get('server_url')}</p>
+<p><b>cookies_count:</b> {result.get('cookies_count')}</p>
+<p><b>has_start:</b> {result.get('has_start', False)} | <b>has_stop:</b> {result.get('has_stop', False)}</p>
+{"<p style='color:red'><b>error:</b> "+result.get("error","")+"</p>" if not result.get("ok") else ""}
+<ul>{rows}</ul>
+<div style="display:flex;gap:16px">
+  <div><p><b>before</b></p>{f"<img src='/{before}' style='max-width:480px'>" if before else "-"}</div>
+  <div><p><b>after</b></p>{f"<img src='/{after}' style='max-width:480px'>" if after else "-"}</div>
+</div>
+<p><a href="/diag?format=json">JSON</a> | <a href="/api/status">/api/status</a></p>
+"""
+    return Response(html, mimetype="text/html")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=PORT)

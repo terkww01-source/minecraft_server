@@ -11,7 +11,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 APP = Flask(__name__)
-
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
 
 SERVER_URL = (os.getenv("MAGMANODE_SERVER_URL", "") or "").strip()
@@ -28,11 +27,26 @@ def make_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1366,768")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(f"--user-agent={UA}")
-    # لاگ شبکه برای دیدن درخواست‌های بعد از کلیک
+    # خاموش کردن نشانه‌های اتوماسیون
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    # لاگ شبکه
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
     service = Service("/usr/bin/chromedriver")
     drv = webdriver.Chrome(service=service, options=opts)
+
+    # ضد‌دیـتکت ساده
+    drv.execute_cdp_cmd("Network.enable", {})
+    drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        Object.defineProperty(navigator, 'platform',  {get: () => 'Linux x86_64'});
+        """
+    })
     drv.set_page_load_timeout(45)
     return drv
 
@@ -44,60 +58,55 @@ def inject_cookies(drv):
     added = 0
     for c in COOKIES:
         try:
-            cookie = {
+            drv.add_cookie({
                 "name": c["name"],
                 "value": c["value"],
-                "domain": c.get("domain", "magmanode.com").lstrip("."),
-                "path": c.get("path", "/"),
+                "domain": c.get("domain","magmanode.com").lstrip("."),
+                "path": c.get("path","/"),
                 "secure": bool(c.get("secure", False)),
                 "httpOnly": bool(c.get("httpOnly", False)),
-            }
-            drv.add_cookie(cookie)
+            })
             added += 1
         except Exception:
             pass
     return added
 
-def find_button(drv, action):
-    sels = [
-        (By.CSS_SELECTOR, f'button[data-action="{action}"]'),
-        (By.XPATH, f'//button[@data-action="{action}"]'),
-        (By.XPATH, '//button[normalize-space()="START"]' if action == "start" else '//button[normalize-space()="STOP"]'),
-        (By.XPATH, '//button[contains(., "START")]' if action == "start" else '//button[contains(., "STOP")]'),
-    ]
-    for by, sel in sels:
-        try:
-            el = WebDriverWait(drv, 10).until(EC.element_to_be_clickable((by, sel)))
-            return el, {"by": str(by), "selector": sel}
-        except Exception:
-            continue
-    return None, None
+def instrument_ajax(drv):
+    js = """
+    window._calls = [];
+    (function(){
+      const origFetch = window.fetch;
+      window.fetch = function(url, opts){
+        try {
+          const o = opts || {};
+          const body = (o && o.body) ? (''+o.body).slice(0,2000) : null;
+          window._calls.push({type:'fetch', url: (''+url), method: (o.method||'GET'), body});
+        } catch(e){}
+        return origFetch.apply(this, arguments);
+      };
+      const XHR = window.XMLHttpRequest;
+      const open = XHR.prototype.open, send = XHR.prototype.send;
+      XHR.prototype.open = function(method, url){
+        this._m = method; this._u = url; return open.apply(this, arguments);
+      };
+      XHR.prototype.send = function(body){
+        try {
+          window._calls.push({type:'xhr', url: (''+(this._u||'')), method: (this._m||''), body: body ? (''+body).slice(0,2000) : null});
+        } catch(e){}
+        return send.apply(this, arguments);
+      };
+    })();
+    """
+    drv.execute_script(js)
 
-def click_hard(drv, el):
-    out = {"clicked_with": []}
+def collect_calls(drv):
     try:
-        el.click()
-        out["clicked_with"].append("native")
-    except Exception as e:
-        out["click_native_error"] = repr(e)
-    try:
-        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        drv.execute_script("arguments[0].click();", el)
-        out["clicked_with"].append("js-click")
-    except Exception as e:
-        out["click_js_error"] = repr(e)
-    try:
-        drv.execute_script("""
-            const ev = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
-            arguments[0].dispatchEvent(ev);
-        """, el)
-        out["clicked_with"].append("dispatch")
-    except Exception as e:
-        out["click_dispatch_error"] = repr(e)
-    return out
+        return drv.execute_script("return window._calls || []") or []
+    except Exception:
+        return []
 
 def collect_network(drv):
-    events = []
+    reqs, resps = [], []
     try:
         logs = drv.get_log("performance")
     except Exception:
@@ -105,33 +114,109 @@ def collect_network(drv):
     for entry in logs:
         try:
             msg = json.loads(entry["message"])["message"]
-            if msg.get("method") == "Network.responseReceived":
-                resp = msg["params"]["response"]
-                url = resp.get("url", "")
-                status = resp.get("status")
-                # درخواست‌های واقعی بعد از کلیک (غیر از لود خود صفحه)
-                if "magmanode.com" in url and not url.endswith("/server"):
-                    events.append({"status": status, "url": url})
+            if msg.get("method") == "Network.requestWillBeSent":
+                r = msg["params"]["request"]
+                reqs.append({
+                    "phase": "req",
+                    "method": r.get("method"),
+                    "url": r.get("url"),
+                    "hasPostData": "postData" in r
+                })
+            elif msg.get("method") == "Network.responseReceived":
+                r = msg["params"]["response"]
+                resps.append({
+                    "phase": "resp",
+                    "status": r.get("status"),
+                    "url": r.get("url")
+                })
         except Exception:
             continue
-    # یکتا
-    uniq = {}
-    for e in events:
-        uniq[e["url"]] = e
-    return list(uniq.values())[:12]
+    # یکی‌کردن روی URL
+    out = []
+    seen = set()
+    for item in reqs + resps:
+        u = item.get("url")
+        if not u or u in seen: 
+            continue
+        seen.add(u)
+        out.append(item)
+        if len(out) >= 20:
+            break
+    return out
 
 def page_status_text(drv):
     try:
-        body_txt = drv.find_element(By.TAG_NAME, "body").text
-        chunk = body_txt[:1200]
+        txt = drv.find_element(By.TAG_NAME, "body").text[:1500]
+        # تشخیص خیلی ساده
         st = "unknown"
-        for word in ["online", "starting", "offline", "running", "stopped"]:
-            if re.search(rf"\\b{word}\\b", chunk, re.I):
-                st = word
-                break
-        return st, chunk
+        for w in ["online","running","starting","offline","stopped"]:
+            if re.search(rf"\\b{w}\\b", txt, re.I):
+                st = w; break
+        return st, txt
     except Exception:
         return "unknown", ""
+
+def find_button(drv, action):
+    sels = [
+        (By.CSS_SELECTOR, f'button[data-action="{action}"]'),
+        (By.XPATH, f'//button[@data-action="{action}"]'),
+        (By.XPATH, '//button[normalize-space()="START"]' if action=="start" else '//button[normalize-space()="STOP"]'),
+        (By.XPATH, '//button[contains(.,"START")]' if action=="start" else '//button[contains(.,"STOP")]'),
+    ]
+    for by, sel in sels:
+        try:
+            el = WebDriverWait(drv, 10).until(EC.element_to_be_clickable((by, sel)))
+            return el, {"by":"css selector" if by==By.CSS_SELECTOR else "xpath", "selector": sel}
+        except Exception:
+            continue
+    return None, None
+
+def click_hard(drv, el):
+    out = {"clicked_with": []}
+    try:
+        el.click(); out["clicked_with"].append("native")
+    except Exception as e:
+        out["native_error"] = repr(e)
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        drv.execute_script("arguments[0].click();", el); out["clicked_with"].append("js-click")
+    except Exception as e:
+        out["js_error"] = repr(e)
+    try:
+        drv.execute_script("arguments[0].dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true}));", el)
+        out["clicked_with"].append("dispatch")
+    except Exception as e:
+        out["dispatch_error"] = repr(e)
+    return out
+
+def http_replay_if_possible(calls):
+    """
+    اگر از داخل صفحه آدرس واقعی استارت/استاپ را گرفتیم، مستقیم با requests بزن.
+    """
+    # کوکی‌ها برای requests
+    jar = {c["name"]: c["value"] for c in COOKIES if "name" in c and "value" in c}
+    headers = {"User-Agent": UA, "Referer": SERVER_URL, "Origin": "https://magmanode.com"}
+
+    tried = []
+    for c in calls:
+        url = c.get("url") or ""
+        method = (c.get("method") or "GET").upper()
+        if "magmanode.com" not in url:
+            continue
+        if not any(k in (url.lower() + " " + (c.get("body") or "").lower()) for k in ["start","stop","action=start","action=stop"]):
+            continue
+        try:
+            if method == "POST":
+                r = requests.post(url, data=(c.get("body") or {}), headers=headers, cookies=jar, timeout=20, allow_redirects=True)
+            else:
+                r = requests.get(url, headers=headers, cookies=jar, timeout=20, allow_redirects=True)
+            tried.append({"url": url, "method": method, "status": r.status_code})
+            # اگر 2xx بود، همین کافی است
+            if 200 <= r.status_code < 300:
+                break
+        except Exception as e:
+            tried.append({"url": url, "method": method, "error": repr(e)})
+    return tried
 
 def do_action(action):
     data = {
@@ -141,13 +226,12 @@ def do_action(action):
         "cookies_count": len(COOKIES),
     }
     if not SERVER_URL:
-        data["error"] = "MAGMANODE_SERVER_URL not set"
-        return data
+        data["error"] = "MAGMANODE_SERVER_URL not set"; return data
 
     drv = None
     try:
         drv = make_driver()
-        added = inject_cookies(drv)
+        inject_cookies(drv)
         drv.get(SERVER_URL)
         time.sleep(2)
 
@@ -155,22 +239,33 @@ def do_action(action):
         has_stop  = len(drv.find_elements(By.CSS_SELECTOR, 'button[data-action="stop"]')) > 0
         data.update({"has_start": has_start, "has_stop": has_stop})
 
-        before_status, _ = page_status_text(drv)
-        data["status_before"] = before_status
+        status_before, _ = page_status_text(drv)
+        data["status_before"] = status_before
 
-        if action in ("start", "stop"):
+        instrument_ajax(drv)
+
+        if action in ("start","stop"):
             el, sel = find_button(drv, action)
             data["selector"] = sel
             if not el:
                 data["error"] = "button_not_found"
             else:
                 data["click"] = click_hard(drv, el)
-                time.sleep(5)  # صبر کن تا درخواست‌ها برن
+                time.sleep(5)  # صبر برای رفتن درخواست‌ها
+        else:
+            data["selector"] = None
 
-        after_status, after_chunk = page_status_text(drv)
-        data["status_after"] = after_status
-        data["text_after_sample"] = after_chunk
+        # جمع‌آوری لاگ‌ها
+        data["calls"] = collect_calls(drv)
         data["network"] = collect_network(drv)
+
+        # تلاش مستقیم HTTP اگر اندپوینت پیدا شد
+        if action in ("start","stop") and data["calls"]:
+            data["http_replay"] = http_replay_if_possible(data["calls"])
+
+        status_after, txt_after = page_status_text(drv)
+        data["status_after"] = status_after
+        data["text_after_sample"] = txt_after
 
         data["ok"] = True
         return data
@@ -189,6 +284,7 @@ def home():
         "<p>رفتن به گزارش: /diag</p>"
         "<p>JSON: /diag?format=json</p>"
         "<p>کلیک و گزارش همزمان: <a href='/diag?action=start'>start</a> | <a href='/diag?action=stop'>stop</a></p>"
+        "<p>هویت مرورگر: <a href='/whoami'>/whoami</a></p>"
     )
 
 @APP.route("/diag")
@@ -212,7 +308,17 @@ def diag():
     if res.get("network"):
         lines.append("\nnetwork:")
         for ev in res["network"]:
-            lines.append(f" - {ev['status']} {ev['url']}")
+            if ev.get("phase")=="req":
+                lines.append(f" - REQ {ev.get('method')} {ev.get('url')}")
+            else:
+                lines.append(f" - RESP {ev.get('status')} {ev.get('url')}")
+    if res.get("http_replay"):
+        lines.append("\nhttp_replay:")
+        for ev in res["http_replay"]:
+            if "status" in ev:
+                lines.append(f" - {ev['method']} {ev['url']} -> {ev['status']}")
+            else:
+                lines.append(f" - {ev['method']} {ev['url']} -> {ev.get('error')}")
     if "error" in res:
         lines.append(f"\nerror: {res['error']}")
     return "Diag\n" + "\n".join(lines)
@@ -234,12 +340,20 @@ def api_status():
 
     return jsonify({
         "service": "render_diag",
-        "version": "v3",
+        "version": "v4",
         "ok": True,
         "pages": {
             "self": {"ok": True, "status": 200, "url": request.url_root},
             "magma": {"ok": magma_ok, "status": magma_status, "url": srv},
         }
+    })
+
+@APP.route("/whoami")
+def whoami():
+    return jsonify({
+        "ua": UA,
+        "env_ok": True,
+        "cookies_count": len(COOKIES),
     })
 
 if __name__ == "__main__":
